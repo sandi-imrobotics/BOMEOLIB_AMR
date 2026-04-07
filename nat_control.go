@@ -306,7 +306,7 @@ func updateStatus(robot map[string]interface{}) {
 	}
 
 	if prevDriveMode != "" && prevDriveMode != status.DriveMode {
-		logInfo("DRIVE_MODE_CHANGE", prevDriveMode+" -> "+status.DriveMode)
+		logInfo("DRIVE_MODE_CHANGE", prevDriveMode+" to "+status.DriveMode)
 
 		if prevDriveMode == "automatic" && status.DriveMode == "manual" {
 			getData(19206, 3003, map[string]interface{}{})
@@ -438,23 +438,135 @@ func calcHash(s AMRStatus) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// ---------------- ACT ----------------
+
+type MoveCmd struct {
+	ID           int `json:"id"`
+	TargetSpotID int `json:"target_spot_id"`
+}
+
+func handleMove(msg *nats.Msg) {
+	fmt.Println("RAW:", string(msg.Data))
+	logInfo("MOVE", string(msg.Data))
+
+	var cmd MoveCmd
+	if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+		fmt.Println("JSON error:", err)
+		return
+	}
+
+	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
+
+	source := currentStation
+	if source == "" {
+		source = "SELF_POSITION"
+	}
+
+	moveCmd := map[string]interface{}{
+		"source_id": source,
+		"id":        targetStr,
+	}
+
+	fmt.Println("MOVE CMD:", moveCmd)
+
+	_, err := getData(19206, 3051, moveCmd)
+	if err != nil {
+		fmt.Println("MOVE API error:", err)
+		return
+	}
+
+	status.CurrentAct = "act.amr." + AMR_ID + ".move"
+	lastCommand = "move"
+}
+
+func handleCharge(msg *nats.Msg) {
+	fmt.Println("RAW:", string(msg.Data))
+	logInfo("CHARGE", string(msg.Data))
+
+	var cmd MoveCmd
+	if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+		fmt.Println("JSON error:", err)
+		return
+	}
+
+	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
+
+	source := currentStation
+	if source == "" {
+		source = "SELF_POSITION"
+	}
+
+	moveCmd := map[string]interface{}{
+		"source_id": source,
+		"id":        targetStr,
+	}
+
+	fmt.Println("CHARGE CMD:", moveCmd)
+
+	getData(19206, 3051, moveCmd)
+
+	status.CurrentAct = "act.amr." + AMR_ID + ".charge"
+	lastCommand = "charge"
+}
+
+func handleStop(msg *nats.Msg) {
+	fmt.Println("STOP")
+	logInfo("STOP", string(msg.Data))
+	getData(19206, 3003, map[string]interface{}{})
+
+	status.CurrentAct = "act.amr." + AMR_ID + ".stop"
+	lastCommand = ""
+}
+
+func handleReady(msg *nats.Msg) {
+	fmt.Println("READY COMMAND RECEIVED")
+	logInfo("READY", string(msg.Data))
+	getData(19206, 3003, map[string]interface{}{})
+
+	status.CurrentAct = "act.amr." + AMR_ID + ".stop"
+	lastCommand = ""
+
+	setReadyWithDelay()
+}
+
 // ---------------- MAIN ----------------
 
 func main() {
 
 	initLogger()
 
-	nc, _ := nats.Connect(
+	nc, err := nats.Connect(
 		NATS_URL,
 		nats.UserInfo(NATS_USER, NATS_PASS),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
 	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer nc.Close()
 
 	status = AMRStatus{
-		FacilityID: 1,
-		DriveMode:  "automatic",
-		CurrentAct: "booting",
-		Alarm:      &Alarm{},
+		FacilityID:  1,
+		DriveMode:   "automatic",
+		CurrentAct:  "booting",
+		Alarm:       &Alarm{},
+		PathSpotIDs: []int{}, // ensure [] at start
 	}
+
+	fmt.Println("Initializing AMR...")
+	for i := 0; i < 500; i++ {
+		getSafeData()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	nc.Subscribe("act.amr."+AMR_ID+".move", handleMove)
+	nc.Subscribe("act.amr."+AMR_ID+".charge", handleCharge)
+	nc.Subscribe("act.amr."+AMR_ID+".stop", handleStop)
+	nc.Subscribe("act.amr."+AMR_ID+".ready", handleReady)
+
+	// trigger ready via NATS
+	nc.Publish("act.amr."+AMR_ID+".ready", []byte("{}"))
 
 	startPolling(nc)
 
