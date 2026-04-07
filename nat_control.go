@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -140,31 +141,31 @@ type Alarm struct {
 }
 
 type AMRStatus struct {
-	FacilityID    int     `json:"id"`
-	DriveMode     string  `json:"drive_mode"`
-	CurrentAct    string  `json:"current_act_name"`
-	PathSpotIDs   []int   `json:"path_spot_names"`
-	CurrentSpotID int     `json:"current_spot_name"`
-	CurrentPose   Pose    `json:"current_pose"`
-	IsRunning     bool    `json:"is_running"`
-	IsCharging    bool    `json:"is_charging"`
-	BatteryLevel  Battery `json:"battery_level"`
-	Alarm         *Alarm  `json:"alarm"`
-	CreatedAt     string  `json:"created_at"`
+	FacilityID    int      `json:"id"`
+	DriveMode     string   `json:"drive_mode"`
+	CurrentAct    string   `json:"current_act_name"`
+	PathSpotIDs   []string `json:"path_spot_names"`
+	CurrentSpotID string   `json:"current_spot_name"`
+	CurrentPose   Pose     `json:"current_pose"`
+	IsRunning     bool     `json:"is_running"`
+	IsCharging    bool     `json:"is_charging"`
+	BatteryLevel  Battery  `json:"battery_level"`
+	Alarm         *Alarm   `json:"alarm"`
+	CreatedAt     string   `json:"created_at"`
 }
 
 type AMRReport struct {
-	FacilityID    int     `json:"facility_id"`
-	DriveMode     string  `json:"drive_mode"`
-	CurrentAct    string  `json:"current_act_name"`
-	PathSpotIDs   []int   `json:"path_spot_names"`
-	CurrentSpotID int     `json:"current_spot_name"`
-	CurrentPose   Pose    `json:"current_pose"`
-	IsRunning     bool    `json:"is_running"`
-	IsCharging    bool    `json:"is_charging"`
-	BatteryLevel  Battery `json:"battery_level"`
-	Alarm         *Alarm  `json:"alarm"`
-	CreatedAt     string  `json:"created_at"`
+	FacilityID    int      `json:"facility_id"`
+	DriveMode     string   `json:"drive_mode"`
+	CurrentAct    string   `json:"current_act_name"`
+	PathSpotIDs   []string `json:"path_spot_names"`
+	CurrentSpotID string   `json:"current_spot_name"`
+	CurrentPose   Pose     `json:"current_pose"`
+	IsRunning     bool     `json:"is_running"`
+	IsCharging    bool     `json:"is_charging"`
+	BatteryLevel  Battery  `json:"battery_level"`
+	Alarm         *Alarm   `json:"alarm"`
+	CreatedAt     string   `json:"created_at"`
 }
 
 // ---------------- GLOBAL ----------------
@@ -181,6 +182,9 @@ var prevAlarm string
 var prevAct string
 var prevDriveMode string
 var prevEmergency bool
+
+var blockStartTime time.Time
+var blockActive bool
 
 // ---------------- UTIL ----------------
 
@@ -319,26 +323,30 @@ func updateStatus(robot map[string]interface{}) {
 	// emergency
 	em, _ := robot["emergency"].(bool)
 	if em && !prevEmergency {
-		logWarn("EMERGENCY", "e-stop pressed")
+		logWarn("EMERGENCY", "emergency stop pressed")
 		status.CurrentAct = "act.amr." + AMR_ID + ".stop"
 		setReadyWithDelay()
 	}
 	prevEmergency = em
 
-	if em {
-		status.Alarm = &Alarm{"warn", "e-stop"}
-	} else {
-		status.Alarm = &Alarm{}
-	}
-
 	// charging
 	status.IsCharging, _ = robot["charging"].(bool)
 
+	// CurrentSpotID
+	if station, ok := robot["current_station"].(string); ok {
+		if station != "" {
+			currentStation = station
+			status.CurrentSpotID = strconv.Itoa(extractNumber(station))
+		} else {
+			currentStation = "SELF_POSITION"
+		}
+	}
+
 	// path
-	status.PathSpotIDs = []int{}
+	status.PathSpotIDs = []string{}
 	if path, ok := robot["unfinished_path"].([]interface{}); ok {
 		for _, p := range path {
-			status.PathSpotIDs = append(status.PathSpotIDs, extractNumber(p.(string)))
+			status.PathSpotIDs = append(status.PathSpotIDs, strconv.Itoa(extractNumber(p.(string))))
 		}
 	}
 
@@ -355,6 +363,8 @@ func updateStatus(robot map[string]interface{}) {
 			}
 		}
 	}
+
+	status.Alarm = buildAlarm(robot)
 
 	// log alarm change
 	alarmStr, _ := json.Marshal(status.Alarm)
@@ -373,7 +383,7 @@ func updateStatus(robot map[string]interface{}) {
 // ---------------- NATS ----------------
 
 func publishStatus(nc *nats.Conn) {
-	status.CreatedAt = time.Now().Format("2006-01-02 15:04:05.000 -0700")
+	status.CreatedAt = time.Now().Format("2006-01-02 15:04:05.000 -07:00")
 	data, _ := json.Marshal(status)
 	nc.Publish("status.amr."+AMR_ID, data)
 }
@@ -390,7 +400,7 @@ func publishReport(nc *nats.Conn) {
 		IsCharging:    status.IsCharging,
 		BatteryLevel:  status.BatteryLevel,
 		Alarm:         status.Alarm,
-		CreatedAt:     time.Now().Format("2006-01-02 15:04:05.000 -0700"),
+		CreatedAt:     time.Now().Format("2006-01-02 15:04:05.000 -07:00"),
 	}
 	data, _ := json.Marshal(r)
 	nc.Publish("report.amr."+AMR_ID, data)
@@ -438,11 +448,81 @@ func calcHash(s AMRStatus) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// ---------------- ALARM ----------------
+
+func buildAlarm(robot map[string]interface{}) *Alarm {
+
+	if fatals, ok := robot["fatals"].([]interface{}); ok && len(fatals) > 0 {
+		if item, ok := fatals[0].(map[string]interface{}); ok {
+			code, _ := item["code"].(float64)
+			desc, _ := item["desc"].(string)
+			return &Alarm{"critical", fmt.Sprintf("%d %s", int(code), desc)}
+		}
+	}
+
+	if errors, ok := robot["errors"].([]interface{}); ok && len(errors) > 0 {
+		if item, ok := errors[0].(map[string]interface{}); ok {
+			code, _ := item["code"].(float64)
+			desc, _ := item["desc"].(string)
+			if int(code) != 52200 {
+				return &Alarm{"critical", fmt.Sprintf("%d %s", int(code), desc)}
+			}
+		}
+	}
+
+	emc, _ := robot["emergency"].(bool)
+	if emc {
+		return &Alarm{"critical", "emergency stop pressed"}
+	}
+
+	if status.BatteryLevel.Kiosk < 20 {
+		return &Alarm{"critical", "kiosk battery low"}
+	}
+	if status.BatteryLevel.AMR < 20 {
+		return &Alarm{"critical", "amr battery low"}
+	}
+
+	// ---------- BLOCK HANDLING ----------
+	blk, _ := robot["blocked"].(bool)
+
+	if blk {
+
+		// first time block detected
+		if !blockActive {
+			blockStartTime = time.Now()
+			blockActive = true
+		}
+
+		elapsed := time.Since(blockStartTime).Seconds()
+
+		if elapsed < 10 {
+			return &Alarm{"noti", "blocked <10s"}
+		} else if elapsed < 20 {
+			return &Alarm{"warn", "blocked 10-20s"}
+		} else {
+			return &Alarm{"critical", "blocked >20s"}
+		}
+
+	} else {
+		// reset when not blocked
+		blockActive = false
+	}
+
+	if status.BatteryLevel.Kiosk < 30 {
+		return &Alarm{"warn", "kiosk battery low"}
+	}
+	if status.BatteryLevel.AMR < 30 {
+		return &Alarm{"warn", "amr battery low"}
+	}
+
+	return &Alarm{"", ""}
+}
+
 // ---------------- ACT ----------------
 
 type MoveCmd struct {
-	ID           int `json:"id"`
-	TargetSpotID int `json:"target_spot_id"`
+	ID           int    `json:"id"`
+	TargetSpotID string `json:"target_spot_name"`
 }
 
 func handleMove(msg *nats.Msg) {
@@ -455,7 +535,7 @@ func handleMove(msg *nats.Msg) {
 		return
 	}
 
-	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
+	targetStr := "LM" + cmd.TargetSpotID
 
 	source := currentStation
 	if source == "" {
@@ -489,7 +569,7 @@ func handleCharge(msg *nats.Msg) {
 		return
 	}
 
-	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
+	targetStr := "LM" + cmd.TargetSpotID
 
 	source := currentStation
 	if source == "" {
@@ -551,11 +631,11 @@ func main() {
 		DriveMode:   "automatic",
 		CurrentAct:  "booting",
 		Alarm:       &Alarm{},
-		PathSpotIDs: []int{}, // ensure [] at start
+		PathSpotIDs: []string{}, // ensure [] at start
 	}
 
 	fmt.Println("Initializing AMR...")
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 100; i++ {
 		getSafeData()
 		time.Sleep(10 * time.Millisecond)
 	}
