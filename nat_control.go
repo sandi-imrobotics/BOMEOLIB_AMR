@@ -223,6 +223,7 @@ func updateStatus(robot map[string]interface{}) {
 
 	// trigger on change automatic -> manual
 	if prevMode == "automatic" && status.DriveMode == "manual" {
+		getData(19206, 3003, map[string]interface{}{})
 		status.CurrentAct = "act.amr." + AMR_ID + ".stop"
 		setReadyWithDelay()
 	}
