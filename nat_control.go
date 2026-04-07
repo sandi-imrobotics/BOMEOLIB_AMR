@@ -237,6 +237,14 @@ func updateStatus(robot map[string]interface{}) {
 		status.Alarm = &Alarm{}
 	}
 
+	//-------------CHARGING-------------
+	sc, _ := robot["charging"].(bool)
+	if sc {
+		status.IsCharging = true
+	} else {
+		status.IsCharging = false
+	}
+
 	// ---------- PATH ----------
 	if path, ok := robot["unfinished_path"].([]interface{}); ok {
 		result := []int{}
