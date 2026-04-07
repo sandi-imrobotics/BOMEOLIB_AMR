@@ -56,7 +56,21 @@ type AMRStatus struct {
 	IsRunning     bool    `json:"is_running"`
 	IsCharging    bool    `json:"is_charging"`
 	BatteryLevel  Battery `json:"battery_level"`
-	SwitchMode    string  `json:"switch_mode"`
+	Alarm         *Alarm  `json:"alarm"`
+	CreatedAt     string  `json:"created_at"`
+}
+
+// report struct (facility_id instead of id)
+type AMRReport struct {
+	FacilityID    int     `json:"facility_id"`
+	DriveMode     string  `json:"drive_mode"`
+	CurrentAct    string  `json:"current_act_name"`
+	PathSpotIDs   []int   `json:"path_spot_ids"`
+	CurrentSpotID int     `json:"current_spot_id"`
+	CurrentPose   Pose    `json:"current_pose"`
+	IsRunning     bool    `json:"is_running"`
+	IsCharging    bool    `json:"is_charging"`
+	BatteryLevel  Battery `json:"battery_level"`
 	Alarm         *Alarm  `json:"alarm"`
 	CreatedAt     string  `json:"created_at"`
 }
@@ -66,6 +80,8 @@ type AMRStatus struct {
 var status AMRStatus
 var lastHash string
 var lastPublish time.Time
+var lastReport time.Time
+
 var lastCommand string = ""
 var currentStation string = "SELF_POSITION"
 
@@ -147,51 +163,6 @@ func getData(port int, msgID uint16, command map[string]interface{}) (map[string
 	return result, nil
 }
 
-// ---------------- ROBOT API ----------------
-
-func queryBatchData() map[string]interface{} {
-	data, err := getData(19204, 1100, map[string]interface{}{
-		"return_laser":   false,
-		"return_beams3D": false,
-		"return_mid360":  false,
-	})
-	if err != nil {
-		return map[string]interface{}{"connected": false}
-	}
-	return data
-}
-
-// ---------------- ALARM ----------------
-
-func buildAlarm(robot map[string]interface{}) *Alarm {
-
-	if fatals, ok := robot["fatals"].([]interface{}); ok && len(fatals) > 0 {
-		if item, ok := fatals[0].(map[string]interface{}); ok {
-			code, _ := item["code"].(float64)
-			desc, _ := item["desc"].(string)
-			return &Alarm{"error", fmt.Sprintf("%d %s", int(code), desc)}
-		}
-	}
-
-	if errors, ok := robot["errors"].([]interface{}); ok && len(errors) > 0 {
-		if item, ok := errors[0].(map[string]interface{}); ok {
-			code, _ := item["code"].(float64)
-			desc, _ := item["desc"].(string)
-			return &Alarm{"error", fmt.Sprintf("%d %s", int(code), desc)}
-		}
-	}
-
-	if status.BatteryLevel.Kiosk < 30 {
-		return &Alarm{"critical", "kiosk battery low"}
-	}
-	if status.BatteryLevel.AMR < 30 {
-		return &Alarm{"critical", "amr battery low"}
-	}
-
-	// return empty object instead of nil
-	return &Alarm{}
-}
-
 // ---------------- READY DELAY ----------------
 
 func setReadyWithDelay() {
@@ -205,6 +176,7 @@ func setReadyWithDelay() {
 
 func updateStatus(robot map[string]interface{}) {
 
+	// ---------- POSE ----------
 	if x, ok := robot["x"].(float64); ok {
 		status.CurrentPose.X = x
 	}
@@ -215,22 +187,57 @@ func updateStatus(robot map[string]interface{}) {
 		status.CurrentPose.Theta = a
 	}
 
+	// ---------- BATTERY ----------
 	if bat, ok := robot["battery_level"].(float64); ok {
 		status.BatteryLevel.AMR = int(bat * 100)
 	}
-
 	status.BatteryLevel.Kiosk = 100
 
-	if station, ok := robot["current_station"].(string); ok {
-		if station != "" {
-			currentStation = station
-			status.CurrentSpotID = extractNumber(station)
-		} else {
-			currentStation = "SELF_POSITION"
+	// ---------- DRIVE MODE (DI) ----------
+	auto := false
+	manual := false
+
+	if di, ok := robot["DI"].([]interface{}); ok {
+		for _, d := range di {
+			if item, ok := d.(map[string]interface{}); ok {
+				id, _ := item["id"].(float64)
+				st, _ := item["status"].(bool)
+
+				if int(id) == 4 {
+					auto = st
+				}
+				if int(id) == 5 {
+					manual = st
+				}
+			}
 		}
 	}
 
-	// ensure [] not null
+	prevMode := status.DriveMode
+
+	if auto && !manual {
+		status.DriveMode = "automatic"
+	} else if !auto && manual {
+		status.DriveMode = "manual"
+	}
+
+	// trigger on change automatic -> manual
+	if prevMode == "automatic" && status.DriveMode == "manual" {
+		status.CurrentAct = "act.amr." + AMR_ID + ".stop"
+		setReadyWithDelay()
+	}
+
+	// ---------- EMERGENCY ----------
+	if em, ok := robot["emergency"].(bool); ok && em {
+		status.Alarm = &Alarm{"warn", "e-stop"}
+
+		status.CurrentAct = "act.amr." + AMR_ID + ".stop"
+		setReadyWithDelay()
+	} else {
+		status.Alarm = &Alarm{}
+	}
+
+	// ---------- PATH ----------
 	if path, ok := robot["unfinished_path"].([]interface{}); ok {
 		result := []int{}
 		for _, p := range path {
@@ -243,6 +250,7 @@ func updateStatus(robot map[string]interface{}) {
 		status.PathSpotIDs = []int{}
 	}
 
+	// ---------- TASK ----------
 	if ts, ok := robot["task_status"].(float64); ok {
 		if int(ts) == 2 {
 			status.IsRunning = true
@@ -252,13 +260,10 @@ func updateStatus(robot map[string]interface{}) {
 			if lastCommand == "move" || lastCommand == "charge" {
 				status.CurrentAct = "act.amr." + AMR_ID + ".stop"
 				lastCommand = ""
-
 				setReadyWithDelay()
 			}
 		}
 	}
-
-	status.Alarm = buildAlarm(robot)
 }
 
 // ---------------- HASH ----------------
@@ -273,10 +278,29 @@ func calcHash(s AMRStatus) string {
 
 // ---------------- NATS ----------------
 
-func publish(nc *nats.Conn) {
+func publishStatus(nc *nats.Conn) {
 	status.CreatedAt = time.Now().Format("2006-01-02 15:04:05.000 -0700")
 	data, _ := json.Marshal(status)
 	nc.Publish("status.amr."+AMR_ID, data)
+}
+
+func publishReport(nc *nats.Conn) {
+	report := AMRReport{
+		FacilityID:    status.FacilityID,
+		DriveMode:     status.DriveMode,
+		CurrentAct:    status.CurrentAct,
+		PathSpotIDs:   status.PathSpotIDs,
+		CurrentSpotID: status.CurrentSpotID,
+		CurrentPose:   status.CurrentPose,
+		IsRunning:     status.IsRunning,
+		IsCharging:    status.IsCharging,
+		BatteryLevel:  status.BatteryLevel,
+		Alarm:         status.Alarm,
+		CreatedAt:     time.Now().Format("2006-01-02 15:04:05.000 -0700"),
+	}
+
+	data, _ := json.Marshal(report)
+	nc.Publish("report.amr."+AMR_ID, data)
 }
 
 // ---------------- POLLING ----------------
@@ -287,18 +311,36 @@ func startPolling(nc *nats.Conn) {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			robot := queryBatchData()
+			robot := getSafeData()
 			updateStatus(robot)
 
 			hash := calcHash(status)
 
 			if hash != lastHash || time.Since(lastPublish) > time.Second {
-				publish(nc)
+				publishStatus(nc)
 				lastHash = hash
 				lastPublish = time.Now()
 			}
+
+			if time.Since(lastReport) > time.Second {
+				publishReport(nc)
+				lastReport = time.Now()
+			}
 		}
 	}()
+}
+
+// safe wrapper
+func getSafeData() map[string]interface{} {
+	data, err := getData(19204, 1100, map[string]interface{}{
+		"return_laser":   false,
+		"return_beams3D": false,
+		"return_mid360":  false,
+	})
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	return data
 }
 
 // ---------------- ACT ----------------
@@ -309,13 +351,8 @@ type MoveCmd struct {
 }
 
 func handleMove(msg *nats.Msg) {
-	fmt.Println("RAW:", string(msg.Data))
-
 	var cmd MoveCmd
-	if err := json.Unmarshal(msg.Data, &cmd); err != nil {
-		fmt.Println("JSON error:", err)
-		return
-	}
+	json.Unmarshal(msg.Data, &cmd)
 
 	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
 
@@ -324,31 +361,18 @@ func handleMove(msg *nats.Msg) {
 		source = "SELF_POSITION"
 	}
 
-	moveCmd := map[string]interface{}{
+	getData(19206, 3051, map[string]interface{}{
 		"source_id": source,
 		"id":        targetStr,
-	}
-
-	fmt.Println("MOVE CMD:", moveCmd)
-
-	_, err := getData(19206, 3051, moveCmd)
-	if err != nil {
-		fmt.Println("MOVE API error:", err)
-		return
-	}
+	})
 
 	status.CurrentAct = "act.amr." + AMR_ID + ".move"
 	lastCommand = "move"
 }
 
 func handleCharge(msg *nats.Msg) {
-	fmt.Println("RAW:", string(msg.Data))
-
 	var cmd MoveCmd
-	if err := json.Unmarshal(msg.Data, &cmd); err != nil {
-		fmt.Println("JSON error:", err)
-		return
-	}
+	json.Unmarshal(msg.Data, &cmd)
 
 	targetStr := fmt.Sprintf("LM%d", cmd.TargetSpotID)
 
@@ -357,35 +381,24 @@ func handleCharge(msg *nats.Msg) {
 		source = "SELF_POSITION"
 	}
 
-	moveCmd := map[string]interface{}{
+	getData(19206, 3051, map[string]interface{}{
 		"source_id": source,
 		"id":        targetStr,
-	}
-
-	fmt.Println("CHARGE CMD:", moveCmd)
-
-	getData(19206, 3051, moveCmd)
+	})
 
 	status.CurrentAct = "act.amr." + AMR_ID + ".charge"
 	lastCommand = "charge"
 }
 
 func handleStop(msg *nats.Msg) {
-	fmt.Println("STOP")
 	getData(19206, 3003, map[string]interface{}{})
-
 	status.CurrentAct = "act.amr." + AMR_ID + ".stop"
 	lastCommand = ""
 }
 
 func handleReady(msg *nats.Msg) {
-	fmt.Println("READY COMMAND RECEIVED")
-
 	getData(19206, 3003, map[string]interface{}{})
-
 	status.CurrentAct = "act.amr." + AMR_ID + ".stop"
-	lastCommand = ""
-
 	setReadyWithDelay()
 }
 
@@ -408,13 +421,12 @@ func main() {
 		FacilityID:  1,
 		DriveMode:   "automatic",
 		CurrentAct:  "booting",
-		Alarm:       &Alarm{}, // ensure {} at start
-		PathSpotIDs: []int{},  // ensure [] at start
+		Alarm:       &Alarm{},
+		PathSpotIDs: []int{},
 	}
 
-	fmt.Println("Initializing AMR...")
-	for i := 0; i < 500; i++ {
-		queryBatchData()
+	for i := 0; i < 200; i++ {
+		getSafeData()
 		time.Sleep(10 * time.Millisecond)
 	}
 
